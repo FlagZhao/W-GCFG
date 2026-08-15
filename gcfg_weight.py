@@ -296,25 +296,50 @@ def parse_source_page(rep_path, launch_counts):
     return out
 
 
+OCC_METRICS = {
+    "Theoretical Occupancy": "theoretical_pct",
+    "Achieved Occupancy": "achieved_pct",
+    "Block Limit Registers": "block_limit_registers",
+    "Block Limit Shared Mem": "block_limit_shared_mem",
+    "Block Limit Warps": "block_limit_warps",
+    "Block Limit Barriers": "block_limit_barriers",
+    "Block Limit SM": "block_limit_sm",
+}
+
+
 def parse_launch_stats(rep_path):
-    """Return ({kernel: registers_per_thread}, {kernel: true_launch_count}).
+    """Return ({kernel: regs_per_thread}, {kernel: launch_count},
+    {kernel: occupancy dict}).
 
     The details page emits one "Registers Per Thread" row per profiled
-    launch, which makes it the authoritative launch count.
+    launch, which makes it the authoritative launch count. Occupancy rows
+    include the block-limit breakdown; the minimum limit is the binding
+    occupancy limiter.
     """
     r = run([os.path.join(CUDA_BIN, "ncu"), "--import", rep_path,
              "--page", "details", "--csv"])
-    regs, launches = {}, defaultdict(int)
+    regs, launches, occ = {}, defaultdict(int), defaultdict(dict)
     for row in csv.reader(io.StringIO(r.stdout)):
+        kname = row[4] if len(row) > 4 else None
         if "Registers Per Thread" in row:
-            i = row.index("Registers Per Thread")
-            kname = row[4] if len(row) > 4 else None
             launches[kname] += 1
             try:
-                regs[kname] = int(float(row[i + 2]))
+                regs[kname] = int(float(row[row.index("Registers Per Thread") + 2]))
             except (ValueError, IndexError):
                 pass
-    return regs, dict(launches)
+        for metric, key in OCC_METRICS.items():
+            if metric in row:
+                try:
+                    occ[kname][key] = float(row[row.index(metric) + 2])
+                except (ValueError, IndexError):
+                    pass
+    for kname, o in occ.items():
+        limits = {k.removeprefix("block_limit_"): v for k, v in o.items()
+                  if k.startswith("block_limit_")}
+        if limits:
+            o["limiter"] = min(limits, key=limits.get)
+            o["registers_are_limiter"] = o["limiter"] == "registers"
+    return regs, dict(launches), dict(occ)
 
 
 # ------------------------------------------------- kernel name matching
@@ -353,7 +378,7 @@ def match_kernel(mangled, ncu_names):
 WARP_SIZE = 32
 
 
-def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread):
+def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread, occupancy):
     result = {}
     for fname, cfg in funcs.items():
         ncu_name = match_kernel(fname, list(ncu_kernels.keys()))
@@ -447,6 +472,7 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread):
             "profiled": ncu_name is not None,
             "launches": ncu_kernels[ncu_name]["launches"] if ncu_name else 0,
             "registers_per_thread": regs_per_thread.get(ncu_name),
+            "occupancy": occupancy.get(ncu_name),
             "bbs": bbs,
             "edges": cfg["edges"],
             "unmatched_ncu_pcs": sorted(unmatched),
@@ -571,12 +597,12 @@ def main():
     if not args.ncu_rep:
         print("[ncu] profiling (this replays kernels several times)...")
         profile(binary, args.app_args, rep, args.ncu_args.split())
-    regs, launch_counts = parse_launch_stats(rep)
+    regs, launch_counts, occ = parse_launch_stats(rep)
     ncu_kernels = parse_source_page(rep, launch_counts)
     print(f"[ncu] {len(ncu_kernels)} profiled kernel(s): {', '.join(ncu_kernels)}")
 
     # 4) merge + emit
-    merged = merge(funcs, live, lineinfo, ncu_kernels, regs)
+    merged = merge(funcs, live, lineinfo, ncu_kernels, regs, occ)
     for fname, data in merged.items():
         safe = re.sub(r"[^\w.]+", "_", fname)[:120]
         with open(os.path.join(outdir, f"{safe}.json"), "w") as f:

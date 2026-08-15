@@ -21,8 +21,16 @@ Basic-block-level aggregates: `exec_count` ((sub)warp executions — under
 independent thread scheduling each subwarp arrival counts once, so divergence
 is captured by the thread/warp ratio), `avg_active_lanes`,
 `avg_pred_on_lanes` (execution-weighted), `divergence` (= 1 − lanes/32),
-`max_live_gpr`, and a source-line histogram (`src_lines`: per-line static
-instruction count and dynamic execution share, plus `src_dominant`).
+and a source-line histogram (`src_lines`: per-line static instruction count
+and dynamic execution share, plus `src_dominant`).
+
+Register flow per basic block (from the `-lrm narrow` per-register life
+ranges, so upstream/downstream effects are explicit): `live_in_gpr`
+(inherited from predecessors), `live_out_gpr` (handed to successors),
+`live_through_gpr` (held across the whole block with no local def/use —
+pressure imposed purely by surrounding code), `max_live_gpr` (peak inside),
+`sum_live_gpr` (static pressure integral), plus the concrete register id
+sets (`gpr_live_in` / `gpr_live_out` / `gpr_live_through`).
 Edges carry topology only — true per-edge traversal counts would need
 LBR-like hardware or binary instrumentation and are out of scope.
 

@@ -109,40 +109,68 @@ def parse_bbcfg(dot_text):
 # ------------------------------------------------------- live registers
 
 def parse_life_ranges(text):
-    """Parse `nvdisasm -c -poff -plr -lrm count` output.
+    """Parse `nvdisasm -c -poff -plr -lrm narrow` output.
 
-    Returns {func_name: {pc: {"live_gpr": n, "live_pred": n, "live_ugpr": n}}}.
+    Returns {func_name: {pc: {"gpr": {reg: sym}, "pred": {...}, "ugpr": {...}}}}
+    where sym is one of `^` (range starts: def), `:` (live through),
+    `v` (range ends: last use), `x` (ends and restarts at this instruction).
+    Register ids come from the vertical digit header; the `#` count columns
+    carry no header digits and are skipped automatically.
     """
     out = defaultdict(dict)
     cur = None
-    header_cols = []
+    group_spans, digit_rows, colmap = None, [], None
     sec_re = re.compile(r"\.section\s+\.text\.([^\s,]+)")
-    inst_re = re.compile(r"/\*([0-9a-fA-F]+)\*/\s+(.*?)\s*;\s*//\s*\|(.*)\|")
+    pc_re = re.compile(r"^\s*/\*([0-9a-fA-F]+)\*/")
 
-    for line in text.splitlines():
-        m = sec_re.search(line)
+    for raw in text.splitlines():
+        m = sec_re.search(raw)
         if m:
             cur = m.group(1)
-            header_cols = []
+            group_spans, digit_rows, colmap = None, [], None
             continue
         if cur is None:
             continue
-        if "|" in line and "//" in line and not header_cols:
-            cells = [c.strip() for c in line.split("//")[-1].strip().strip("|").split("|")]
-            if any(c in ("GPR", "PRED", "UGPR") for c in cells):
-                header_cols = cells
+        ci = raw.find("//")
+        if ci < 0:
+            continue
+        seg = raw[ci + 2:]
+
+        if colmap is None:
+            words = set(seg.replace("|", " ").split())
+            if words and words <= {"GPR", "PRED", "UGPR"}:
+                pipes = [i for i, ch in enumerate(seg) if ch == "|"]
+                group_spans = [(a + 1, b, seg[a + 1:b].strip())
+                               for a, b in zip(pipes, pipes[1:])
+                               if seg[a + 1:b].strip()]
                 continue
-        m = inst_re.search(line)
-        if m and header_cols:
-            pc = int(m.group(1), 16)
-            cells = [c.strip() for c in m.group(3).split("|")]
-            rec = {}
-            for name, val in zip(header_cols, cells):
-                key = {"GPR": "live_gpr", "PRED": "live_pred",
-                       "UGPR": "live_ugpr"}.get(name)
-                if key:
-                    rec[key] = int(val) if val else 0
-            out[cur][pc] = rec
+            if group_spans and re.fullmatch(r"[0-9 #|]*", seg.rstrip()) \
+                    and any(c.isdigit() for c in seg):
+                digit_rows.append(seg)
+                continue
+
+        m = pc_re.match(raw)
+        if not m:
+            continue
+        if colmap is None:
+            if not digit_rows or not group_spans:
+                continue
+            width = max(len(r) for r in digit_rows)
+            colmap = []
+            for c in range(width):
+                digs = "".join(r[c] for r in digit_rows
+                               if c < len(r) and r[c].isdigit())
+                if digs:
+                    grp = next((n for a, b, n in group_spans if a <= c < b), None)
+                    if grp:
+                        colmap.append((c, grp.lower(), int(digs)))
+        pc = int(m.group(1), 16)
+        rec = {"gpr": {}, "pred": {}, "ugpr": {}}
+        for c, grp, rid in colmap:
+            ch = seg[c] if c < len(seg) else " "
+            if ch in "^:vx":
+                rec[grp][rid] = ch
+        out[cur][pc] = rec
     return dict(out)
 
 
@@ -340,7 +368,11 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread):
             for inst in bb["insts"]:
                 pc = inst["pc"]
                 rec = {"pc": pc, "pc_hex": f"{pc:04x}", "sass": inst["sass"]}
-                rec.update(flive.get(pc, {}))
+                lv = flive.get(pc)
+                if lv:
+                    rec["live_gpr"] = len(lv["gpr"])
+                    rec["live_pred"] = len(lv["pred"])
+                    rec["live_ugpr"] = len(lv["ugpr"])
                 if pc in flines:
                     rec["file"], rec["line"] = flines[pc]
                 if pc in per_pc:
@@ -348,6 +380,23 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread):
                     rec.update({k: v for k, v in m.items() if k != "sass_ncu"})
                     unmatched.discard(pc)
                 insts.append(rec)
+
+            # register flow across this BB, from the per-PC liveness symbol
+            # maps: live-in inherited from predecessors, live-out handed to
+            # successors, live-through = held across the whole block without
+            # any local def/use (pressure imposed purely by up/downstream).
+            first_lv = flive.get(insts[0]["pc"], {"gpr": {}})
+            last_lv = flive.get(insts[-1]["pc"], {"gpr": {}})
+            gpr_in = sorted(r for r, s in first_lv["gpr"].items() if s in ":vx")
+            gpr_out = sorted(r for r, s in last_lv["gpr"].items() if s in ":^x")
+            thru = set(gpr_in)
+            for r in bb["insts"]:
+                lv = flive.get(r["pc"])
+                if lv is None:
+                    thru = set()
+                    break
+                thru &= {reg for reg, s in lv["gpr"].items() if s == ":"}
+            gpr_thru = sorted(thru)
 
             ie = [r.get("inst_executed") for r in insts if r.get("inst_executed") is not None]
             tie = [r.get("thread_inst_executed") for r in insts if r.get("thread_inst_executed") is not None]
@@ -379,6 +428,11 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread):
                 "avg_pred_on_lanes": avg_pred_on,
                 "divergence": round(1 - avg_lanes / WARP_SIZE, 3) if avg_lanes else None,
                 "max_live_gpr": max((r.get("live_gpr", 0) for r in insts), default=0),
+                "sum_live_gpr": sum(r.get("live_gpr", 0) for r in insts),
+                "live_in_gpr": len(gpr_in), "live_out_gpr": len(gpr_out),
+                "live_through_gpr": len(gpr_thru),
+                "gpr_live_in": gpr_in, "gpr_live_out": gpr_out,
+                "gpr_live_through": gpr_thru,
                 "src_dominant": dominant,
                 "src_lines": dict(sorted(line_hist.items())),
                 "insts": insts,
@@ -435,7 +489,9 @@ def write_dot(fname, data, path):
                 lines.append(f"warp execs: {bb['exec_count']:,}")
                 lines.append(f"avg lanes: {bb['avg_active_lanes']}"
                              f"  div: {bb['divergence']}")
-            lines.append(f"max live GPR: {bb['max_live_gpr']}")
+            lines.append(f"GPR in/thru/peak/out: {bb['live_in_gpr']}/"
+                         f"{bb['live_through_gpr']}/{bb['max_live_gpr']}/"
+                         f"{bb['live_out_gpr']}")
             # header centered via \n, then one left-justified line per instruction
             label = "\\n".join(lines) + "\\n"
             for inst in bb["insts"]:
@@ -495,7 +551,7 @@ def main():
         dot = run([os.path.join(CUDA_BIN, "nvdisasm"), "-bbcfg", "-poff", cb]).stdout
         funcs.update(parse_bbcfg(dot))
         plr = run([os.path.join(CUDA_BIN, "nvdisasm"), "-c", "-poff",
-                   "-plr", "-lrm", "count", cb]).stdout
+                   "-plr", "-lrm", "narrow", cb]).stdout
         live.update(parse_life_ranges(plr))
         li = run([os.path.join(CUDA_BIN, "nvdisasm"), "-c", "-poff", "-g", cb],
                  check=False).stdout

@@ -78,10 +78,3 @@ corresponding host program).
   executed**
 - Profiling requires GPU performance-counter permissions; ncu replays each
   kernel several times
-
-## Validation (test_kernels/vecop.cu, RTX 5090 / sm_120)
-
-99/99 static PCs aligned with NCU data. Semantic checks: the `(i & 16)` branch
-compiles to predication, and the `@P0 FFMA` shows `avg_pred_on_lanes = 16.0`
-(exactly half of each warp); the `i % 7` remainder loop shows avg lanes of
-13.714 and the reconvergence point 8.0 — all as expected.

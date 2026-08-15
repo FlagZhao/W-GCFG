@@ -1,0 +1,12 @@
+# compiled test binaries and extracted cubins
+test_kernels/vecop
+test_kernels/validate
+*.cubin
+*.o
+
+# pipeline outputs (regenerable)
+gcfg_out/
+*_out/
+*.ncu-rep
+
+__pycache__/

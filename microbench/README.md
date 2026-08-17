@@ -31,3 +31,25 @@ Results on RTX 5090 (GB202, sm_120), driver 580.97, CUDA 13.0, reps=64:
   multiple warps (6.4-7.3) is worse than single-warp streaming (4.27).
 - Unresolved: per-SM vs per-TPC sharing (needs SM-affinity control, e.g.
   green contexts). Either way the per-kernel hot-path budget is 128KB.
+
+## ptxas spill-heuristic probes (spillprobe.cu)
+
+Black-box probes of the closed-source ptxas allocator, forced to spill via
+-maxrregcount=24 (observed floor on sm_120; lower values are bumped up).
+Defs are pinned with an early checksum store (defeats load/compute sinking).
+
+- **Loop-depth awareness: confirmed.** Values unused inside the loop are
+  parked across it; reloads land in the post-loop block; the loop body
+  contains zero spill instructions.
+- **Trap-coldness heuristic: confirmed.** With symmetric data-dependent
+  branches, ptxas preferentially spills values used in the __trap()-ending
+  path (reloads inside the trap path, none in the normal path). Robust to
+  swapping the branch condition polarity. ptxas also consistently lays the
+  trap path out as the fallthrough.
+- ptxas moves loop counters to uniform registers (UR) under pressure.
+
+Refined claim: ptxas has no EXTERNAL frequency channel (PTX carries no
+branch probabilities), but it DOES apply internal static coldness
+heuristics (trap, loop depth). The dynamic-profile increment is therefore:
+data-dependent cold branches with no syntactic marker, plus quantification
+for spill/occupancy tradeoffs.

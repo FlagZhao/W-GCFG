@@ -138,7 +138,8 @@ def parse_life_ranges(text):
 
         if colmap is None:
             words = set(seg.replace("|", " ").split())
-            if words and words <= {"GPR", "PRED", "UGPR"}:
+            if words and "GPR" in words and \
+                    all(re.fullmatch(r"[A-Z]+", w) for w in words):
                 pipes = [i for i, ch in enumerate(seg) if ch == "|"]
                 group_spans = [(a + 1, b, seg[a + 1:b].strip())
                                for a, b in zip(pipes, pipes[1:])
@@ -165,11 +166,11 @@ def parse_life_ranges(text):
                     if grp:
                         colmap.append((c, grp.lower(), int(digs)))
         pc = int(m.group(1), 16)
-        rec = {"gpr": {}, "pred": {}, "ugpr": {}}
+        rec = {}
         for c, grp, rid in colmap:
             ch = seg[c] if c < len(seg) else " "
             if ch in "^:vx":
-                rec[grp][rid] = ch
+                rec.setdefault(grp, {})[rid] = ch
         out[cur][pc] = rec
     return dict(out)
 
@@ -275,7 +276,7 @@ def parse_source_page(rep_path, launch_counts):
 
     out = {}
     for kname, per_off in kernels.items():
-        n_launch = launch_counts.get(kname, 1) or 1
+        n_launch = norm_lookup(launch_counts, kname, 1) or 1
         dup = blocks_seen[kname] // n_launch if blocks_seen[kname] % n_launch == 0 else 1
         if dup > 1:
             print(f"[ncu] {kname}: {blocks_seen[kname]} source blocks for "
@@ -356,9 +357,26 @@ def demangle(name):
 
 
 def norm_sig(sig):
-    """Normalize a demangled signature so 'const float *' == 'float const*'."""
+    """Normalize a demangled signature across demangler dialects:
+    'const float *' == 'float const*', '(bool)1' == '1', 'std::' dropped
+    (NCU's details and source pages demangle differently)."""
     s = re.sub(r"\bconst\s+(\w+)", r"\1 const", sig)
+    s = s.replace("std::", "")
+    s = re.sub(r"\((?:bool|char|short|int|long|unsigned \w+)\)", "", s)
     return re.sub(r"\s+", "", s)
+
+
+def norm_lookup(d, name, default=None):
+    """Fetch d[name] tolerating demangler-dialect differences in keys."""
+    if name in d:
+        return d[name]
+    target = norm_sig(name)
+    for k, v in d.items():
+        if norm_sig(k) == target:
+            return v
+    base = name.split("(")[0]
+    hits = [v for k, v in d.items() if k.split("(")[0] == base]
+    return hits[0] if len(hits) == 1 else default
 
 
 def match_kernel(mangled, ncu_names):
@@ -394,10 +412,9 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread, occupancy):
                 pc = inst["pc"]
                 rec = {"pc": pc, "pc_hex": f"{pc:04x}", "sass": inst["sass"]}
                 lv = flive.get(pc)
-                if lv:
-                    rec["live_gpr"] = len(lv["gpr"])
-                    rec["live_pred"] = len(lv["pred"])
-                    rec["live_ugpr"] = len(lv["ugpr"])
+                if lv is not None:
+                    for grp in ("gpr", "pred", "ugpr", "upred"):
+                        rec[f"live_{grp}"] = len(lv.get(grp, {}))
                 if pc in flines:
                     rec["file"], rec["line"] = flines[pc]
                 if pc in per_pc:
@@ -410,17 +427,17 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread, occupancy):
             # maps: live-in inherited from predecessors, live-out handed to
             # successors, live-through = held across the whole block without
             # any local def/use (pressure imposed purely by up/downstream).
-            first_lv = flive.get(insts[0]["pc"], {"gpr": {}})
-            last_lv = flive.get(insts[-1]["pc"], {"gpr": {}})
-            gpr_in = sorted(r for r, s in first_lv["gpr"].items() if s in ":vx")
-            gpr_out = sorted(r for r, s in last_lv["gpr"].items() if s in ":^x")
+            first_lv = flive.get(insts[0]["pc"], {})
+            last_lv = flive.get(insts[-1]["pc"], {})
+            gpr_in = sorted(r for r, s in first_lv.get("gpr", {}).items() if s in ":vx")
+            gpr_out = sorted(r for r, s in last_lv.get("gpr", {}).items() if s in ":^x")
             thru = set(gpr_in)
             for r in bb["insts"]:
                 lv = flive.get(r["pc"])
                 if lv is None:
                     thru = set()
                     break
-                thru &= {reg for reg, s in lv["gpr"].items() if s == ":"}
+                thru &= {reg for reg, s in lv.get("gpr", {}).items() if s == ":"}
             gpr_thru = sorted(thru)
 
             ie = [r.get("inst_executed") for r in insts if r.get("inst_executed") is not None]
@@ -471,8 +488,8 @@ def merge(funcs, live, lineinfo, ncu_kernels, regs_per_thread, occupancy):
             "mangled": fname,
             "profiled": ncu_name is not None,
             "launches": ncu_kernels[ncu_name]["launches"] if ncu_name else 0,
-            "registers_per_thread": regs_per_thread.get(ncu_name),
-            "occupancy": occupancy.get(ncu_name),
+            "registers_per_thread": norm_lookup(regs_per_thread, ncu_name) if ncu_name else None,
+            "occupancy": norm_lookup(occupancy, ncu_name) if ncu_name else None,
             "bbs": bbs,
             "edges": cfg["edges"],
             "unmatched_ncu_pcs": sorted(unmatched),

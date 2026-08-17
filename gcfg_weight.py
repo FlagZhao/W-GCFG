@@ -591,11 +591,19 @@ def main():
     # 2) static CFG + live ranges per cubin
     funcs, live, lineinfo = {}, {}, {}
     for cb in cubins:
-        dot = run([os.path.join(CUDA_BIN, "nvdisasm"), "-bbcfg", "-poff", cb]).stdout
-        funcs.update(parse_bbcfg(dot))
-        plr = run([os.path.join(CUDA_BIN, "nvdisasm"), "-c", "-poff",
-                   "-plr", "-lrm", "narrow", cb]).stdout
-        live.update(parse_life_ranges(plr))
+        try:
+            dot = run([os.path.join(CUDA_BIN, "nvdisasm"), "-bbcfg", "-poff", cb]).stdout
+            funcs.update(parse_bbcfg(dot))
+        except subprocess.CalledProcessError:
+            print(f"[static] WARNING: nvdisasm -bbcfg failed on {os.path.basename(cb)}, skipping")
+            continue
+        try:
+            plr = run([os.path.join(CUDA_BIN, "nvdisasm"), "-c", "-poff",
+                       "-plr", "-lrm", "narrow", cb]).stdout
+            live.update(parse_life_ranges(plr))
+        except subprocess.CalledProcessError:
+            print(f"[static] WARNING: -plr failed on {os.path.basename(cb)} "
+                  f"(no liveness for its kernels)")
         li = run([os.path.join(CUDA_BIN, "nvdisasm"), "-c", "-poff", "-g", cb],
                  check=False).stdout
         lineinfo.update(parse_line_info(li))
